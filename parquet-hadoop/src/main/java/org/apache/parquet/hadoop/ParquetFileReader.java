@@ -44,7 +44,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -55,7 +54,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -75,12 +73,11 @@ import org.apache.parquet.column.page.DictionaryPage;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.crypto.ColumnDecryptors;
 import org.apache.parquet.crypto.DecryptionSetup;
-import org.apache.parquet.crypto.IntegerKeyIdRetriever;
 import org.apache.parquet.crypto.ParquetEncryptionFactory;
 import org.apache.parquet.crypto.ParquetFileDecryptor;
-import org.apache.parquet.crypto.ParquetFileEncryptor;
+import org.apache.parquet.crypto.StringKeyIdRetriever;
 import org.apache.parquet.hadoop.metadata.ColumnPath;
-import org.apache.parquet.format.BlockCrypto;
+import org.apache.parquet.format.BlockCipher;
 import org.apache.parquet.format.DataPageHeader;
 import org.apache.parquet.format.DataPageHeaderV2;
 import org.apache.parquet.format.DictionaryPageHeader;
@@ -122,7 +119,7 @@ public class ParquetFileReader implements Closeable {
   private final ParquetMetadataConverter converter;
 
   private static final String encryptedSuffix = ParquetOutputFormat.encryptedSuffix;
-  
+
   private static final HashMap<String,ParquetFileDecryptor> fileDecryptorMap = new HashMap<String,ParquetFileDecryptor>();
 
   /**
@@ -394,38 +391,46 @@ public class ParquetFileReader implements Closeable {
 
   //TODO 
   private static ParquetFileDecryptor getFileDecryptor(Path file, Configuration configuration) throws IOException {
-    
-    if (!file.toString().contains(encryptedSuffix)) return null; //TODO
-    
-    String encrPath = file.getParent().toString();
-    
-    ParquetFileDecryptor pfd = fileDecryptorMap.get(encrPath); // TODO synch
-    
-    if (null != pfd) return pfd;
-    
-    String decryptionKey = configuration.get("parquet.decryption.key");
-    
-    if (null != decryptionKey) {
-      byte[] keyBytes = Base64.getDecoder().decode(decryptionKey);
-      pfd = ParquetEncryptionFactory.createFileDecryptor(keyBytes);
-    }
-    else {
-      String[] keys = configuration.getTrimmedStrings("parquet.decryption.keys");
-      IntegerKeyIdRetriever kr = new IntegerKeyIdRetriever();
-      for (int i=0; i < keys.length; i+=2) {
-        int keyId = Integer.valueOf(keys[i]);
-        byte[] keyBytes = Base64.getDecoder().decode(keys[i+1]);
-        kr.putKey(keyId, keyBytes);
-      }
-      DecryptionSetup dSetup = new DecryptionSetup(kr);
-      pfd = ParquetEncryptionFactory.createFileDecryptor(dSetup);
-    }
-    
-    if (null == pfd) throw new IOException("Decryption key not specified for file "+file);
-    
-    fileDecryptorMap.put(encrPath, pfd);
 
-    return pfd;
+    if (!file.toString().contains(encryptedSuffix)) return null; //TODO
+
+    //System.out.println("Reading encrypted Parquet file: " + file);
+
+    synchronized (fileDecryptorMap) {
+      String encrPath = file.getParent().toString();
+
+      // Parent!! One decryptor for all folder files
+      // Wont work with different AADs or iv-prefixes
+      ParquetFileDecryptor pfd = fileDecryptorMap.get(encrPath);
+
+      if (null != pfd) return pfd;
+
+      // Parsed again for each new folder
+      String encryptionKeys[] = configuration.getTrimmedStrings("encryption.key.list");
+      if (null != encryptionKeys && encryptionKeys.length > 0) {
+        int nKeys = encryptionKeys.length;
+        StringKeyIdRetriever kr = new StringKeyIdRetriever();
+        for (int i=0; i < nKeys; i++) {
+          String[] parts = encryptionKeys[i].split(":");
+          byte[] keyBytes = Base64.getDecoder().decode(parts[1]);
+          kr.putKey(parts[0], keyBytes);
+        }
+        DecryptionSetup dSetup = new DecryptionSetup(kr);
+        pfd = ParquetEncryptionFactory.createFileDecryptor(dSetup);
+
+        //TODO
+        //String AAD = file.getParent().getName()+"/"+file.getName();
+        //pfd.setAAD(AAD.getBytes("UTF-8"));
+
+        fileDecryptorMap.put(encrPath, pfd);
+
+        return pfd;
+      }
+      else {
+        throw new IOException("Encrypted file. No keys available. Set using encryption.key.list");
+      }
+    }
+
   }
 
   /**
@@ -781,16 +786,28 @@ public class ParquetFileReader implements Closeable {
     ConsecutiveChunkList currentChunks = null;
     for (ColumnChunkMetaData mc : block.getColumns()) {
       ColumnPath pathKey = mc.getPath();
-      BenchmarkCounter.incrementTotalBytes(mc.getTotalSize());
+      if (!mc.isHiddenColumn()) { //TODO replace with RowGroup.getTotal_compressed_size or .getTotal_byte_size 
+        BenchmarkCounter.incrementTotalBytes(mc.getTotalSize());
+      }
       ColumnDescriptor columnDescriptor = paths.get(pathKey);
       if (columnDescriptor != null) {
-        long startingPos = mc.getStartingPos();
-        // first chunk or not consecutive => new list
-        if (currentChunks == null || currentChunks.endPos() != startingPos) {
-          currentChunks = new ConsecutiveChunkList(startingPos);
-          allChunks.add(currentChunks);
+        if (!mc.isHiddenColumn()) { 
+          long startingPos = mc.getStartingPos();
+          // first chunk or not consecutive => new list
+          if (currentChunks == null || currentChunks.endPos() != startingPos) {
+            currentChunks = new ConsecutiveChunkList(startingPos);
+            allChunks.add(currentChunks);
+          }
+          currentChunks.addChunk(new ChunkDescriptor(columnDescriptor, mc, false, startingPos, (int)mc.getTotalSize()));
         }
-        currentChunks.addChunk(new ChunkDescriptor(columnDescriptor, mc, startingPos, (int)mc.getTotalSize()));
+        else {
+          // TODO Handle not consecutive chunks
+          if (currentChunks == null) {
+            currentChunks = new ConsecutiveChunkList(0);
+            allChunks.add(currentChunks);
+          }
+          currentChunks.addChunk(new ChunkDescriptor(columnDescriptor, mc, true, -1, -1));
+        }
       }
     }
     // actually read all the chunks
@@ -801,12 +818,19 @@ public class ParquetFileReader implements Closeable {
           currentRowGroup.addColumn(chunk.descriptor.col, chunk.readAllPages());
         }
         else {
-          ColumnDecryptors decryptors = fileDecryptor.getColumnDecryptors(chunk.descriptor.col.getPath());
-          if (null == decryptors) {
-            currentRowGroup.addColumn(chunk.descriptor.col, chunk.readAllPages());
+          if (chunk.descriptor.hiddenColumn) {
+            currentRowGroup.addHiddenColumn(chunk.descriptor.col);
           }
           else {
-            currentRowGroup.addColumn(chunk.descriptor.col, chunk.readAllPages(decryptors.getMetadataDecryptor(), decryptors.getDataDecryptor()));
+            // TODO keep decryptors in ColumnChunkMetaData?
+            ColumnDecryptors decryptors = fileDecryptor.getColumnDecryptors(chunk.descriptor.col.getPath());
+            if (decryptors.getStatus() == ColumnDecryptors.Status.PLAINTEXT) {
+              currentRowGroup.addColumn(chunk.descriptor.col, chunk.readAllPages());
+            }
+            else if (decryptors.getStatus() == ColumnDecryptors.Status.KEY_AVAILABLE) {
+              currentRowGroup.addColumn(chunk.descriptor.col, 
+                  chunk.readAllPages(decryptors.getMetadataDecryptor(), decryptors.getDataDecryptor()));
+            }
           }
         }
       }
@@ -943,10 +967,10 @@ public class ParquetFileReader implements Closeable {
     }
 
     protected PageHeader readPageHeader() throws IOException {
-      return readPageHeader((BlockCrypto.Decryptor) null);
+      return readPageHeader((BlockCipher.Decryptor) null);
     }
 
-    protected PageHeader readPageHeader(BlockCrypto.Decryptor blockDecryptor) throws IOException {
+    protected PageHeader readPageHeader(BlockCipher.Decryptor blockDecryptor) throws IOException {
       return Util.readPageHeader(this, blockDecryptor);
     }
 
@@ -955,10 +979,10 @@ public class ParquetFileReader implements Closeable {
      * @return the list of pages
      */
     public ColumnChunkPageReader readAllPages() throws IOException {
-      return readAllPages((BlockCrypto.Decryptor) null, (BlockCrypto.Decryptor) null);
+      return readAllPages((BlockCipher.Decryptor) null, (BlockCipher.Decryptor) null);
     }
 
-    public ColumnChunkPageReader readAllPages(BlockCrypto.Decryptor headerBlockDecryptor, BlockCrypto.Decryptor pageBlockDecryptor) throws IOException {
+    public ColumnChunkPageReader readAllPages(BlockCipher.Decryptor headerBlockDecryptor, BlockCipher.Decryptor pageBlockDecryptor) throws IOException {
       List<DataPage> pagesInChunk = new ArrayList<DataPage>();
       DictionaryPage dictionaryPage = null;
       PrimitiveType type = getFileMetaData().getSchema()
@@ -1036,7 +1060,7 @@ public class ParquetFileReader implements Closeable {
                 + " pages ending at file offset " + (descriptor.fileOffset + pos()));
       }
       BytesDecompressor decompressor = codecFactory.getDecompressor(descriptor.metadata.getCodec());
-      return new ColumnChunkPageReader(decompressor, pagesInChunk, dictionaryPage, pageBlockDecryptor);
+      return new ColumnChunkPageReader(descriptor.col.getPath(), decompressor, pagesInChunk, dictionaryPage, pageBlockDecryptor);
     }
 
     /**
@@ -1124,6 +1148,7 @@ public class ParquetFileReader implements Closeable {
     private final ColumnChunkMetaData metadata;
     private final long fileOffset;
     private final int size;
+    private final boolean hiddenColumn;
 
     /**
      * @param col column this chunk is part of
@@ -1134,6 +1159,7 @@ public class ParquetFileReader implements Closeable {
     private ChunkDescriptor(
         ColumnDescriptor col,
         ColumnChunkMetaData metadata,
+        boolean hidden,
         long fileOffset,
         int size) {
       super();
@@ -1141,6 +1167,7 @@ public class ParquetFileReader implements Closeable {
       this.metadata = metadata;
       this.fileOffset = fileOffset;
       this.size = size;
+      this.hiddenColumn = hidden;
     }
   }
 
@@ -1169,7 +1196,7 @@ public class ParquetFileReader implements Closeable {
      */
     public void addChunk(ChunkDescriptor descriptor) {
       chunks.add(descriptor);
-      length += descriptor.size;
+      if (!descriptor.hiddenColumn) length += descriptor.size;
     }
 
     /**
@@ -1208,4 +1235,3 @@ public class ParquetFileReader implements Closeable {
   }
 
 }
-

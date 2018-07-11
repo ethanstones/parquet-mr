@@ -23,11 +23,10 @@ import static org.apache.parquet.hadoop.ParquetWriter.DEFAULT_BLOCK_SIZE;
 import static org.apache.parquet.hadoop.util.ContextUtil.getConfiguration;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -41,8 +40,8 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.ParquetProperties.WriterVersion;
-import org.apache.parquet.crypto.Cipher;
-import org.apache.parquet.crypto.ColumnMetadata;
+import org.apache.parquet.crypto.ParquetCipher;
+import org.apache.parquet.crypto.ColumnCryptodata;
 import org.apache.parquet.crypto.EncryptionSetup;
 import org.apache.parquet.crypto.ParquetEncryptionFactory;
 import org.apache.parquet.crypto.ParquetFileEncryptor;
@@ -128,8 +127,11 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   public static final String MIN_ROW_COUNT_FOR_PAGE_SIZE_CHECK = "parquet.page.size.row.check.min";
   public static final String MAX_ROW_COUNT_FOR_PAGE_SIZE_CHECK = "parquet.page.size.row.check.max";
   public static final String ESTIMATE_PAGE_SIZE_CHECK = "parquet.page.size.check.estimate";
-  
+
   static final String encryptedSuffix = ".encrypted";
+
+  private static final HashMap<String,byte[]> encryptionKeyMap = new HashMap<String,byte[]>();
+  private static volatile boolean encryptionKeysSet = false;
 
   // default to no padding for now
   private static final int DEFAULT_MAX_PADDING_SIZE = 0;
@@ -139,7 +141,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setWriteSupportClass(JobConf job, Class<?> writeSupportClass) {
-      job.set(WRITE_SUPPORT_CLASS, writeSupportClass.getName());
+    job.set(WRITE_SUPPORT_CLASS, writeSupportClass.getName());
   }
 
   public static Class<?> getWriteSupportClass(Configuration configuration) {
@@ -307,61 +309,100 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
       throws IOException, InterruptedException {
 
     final Configuration conf = getConfiguration(taskAttemptContext);
-    
+
     Path file;
     CompressionCodecName codec = getCodec(taskAttemptContext);
-    
+
+    String extension = codec.getExtension() + ".parquet";
+
     ParquetFileEncryptor fileEncryptor = null;
-    String encryptionKeys[] = conf.getTrimmedStrings("parquet.encryption.keys");
-    if (null != encryptionKeys && encryptionKeys.length > 0) {
-      EncryptionSetup eSetup;
-      int nKeys = encryptionKeys.length / 2;
-      HashMap<Integer,byte[]> keyMap = new HashMap<Integer,byte[]>();
-      int footerKeyId=0;
-      byte[] footerKey=null;
-      for (int i=0; i < nKeys; i++) {
-        Integer id = Integer.valueOf(encryptionKeys[i*2]);
-        byte[] key = Base64.getDecoder().decode(encryptionKeys[i*2+1]);
-        keyMap.put(id, key);
-        if (i == 0) {
-          footerKeyId = id;
-          footerKey = key;
+
+    synchronized (encryptionKeyMap) {
+      if (!encryptionKeysSet) {
+        String encryptionKeys[] = conf.getTrimmedStrings("encryption.key.list");
+        if (null != encryptionKeys && encryptionKeys.length > 0) {
+          encryptionKeysSet = true;
+          int nKeys = encryptionKeys.length;
+          for (int i=0; i < nKeys; i++) {
+            String[] parts = encryptionKeys[i].split(":");
+            byte[] keyBytes = Base64.getDecoder().decode(parts[1]);
+            encryptionKeyMap.put(parts[0], keyBytes);
+          }
         }
       }
-      
-      eSetup = new EncryptionSetup(Cipher.AES_GCM_V1, footerKey, footerKeyId);
-      
-      String extension = codec.getExtension() + ".parquet"+encryptedSuffix;
-      file = getDefaultWorkFile(taskAttemptContext, extension);
-      
-      String columnsToEncrypt[] = conf.getTrimmedStrings("parquet.encryption.columns");
-      if (null != columnsToEncrypt && columnsToEncrypt.length > 0) {
-        ArrayList<ColumnMetadata> columns = new ArrayList<ColumnMetadata>();
-        for (int i = 0; i < columnsToEncrypt.length; i+=2) {
-          Integer key_id = Integer.valueOf(columnsToEncrypt[i]);
-          byte[] key = keyMap.get(key_id);
-          ColumnMetadata cmd = new ColumnMetadata(true, columnsToEncrypt[i+1]);
-          cmd.setEncryptionKey(key, key_id);
-          columns.add(cmd);
-        }
-        eSetup.setColumnMetadata(columns, false);
-      }
-      
-      fileEncryptor = ParquetEncryptionFactory.createFileEncryptor(eSetup);
+    }
+
+    if (!encryptionKeysSet) {
+      String crypto = conf.getTrimmed("encryption.footer.key");
+      if (null != crypto) throw new IOException("Encryption keys are not set");
+      crypto = conf.getTrimmed("encryption.uniform.key");
+      if (null != crypto) throw new IOException("Encryption keys are not set");
     }
     else {
-      String extension = codec.getExtension() + ".parquet";
-      file = getDefaultWorkFile(taskAttemptContext, extension);
+      String algo = conf.getTrimmed("encryption.algorithm");
+      ParquetCipher cipher = ParquetCipher.fromConf(algo);
+      
+      String uniformKey = conf.getTrimmed("encryption.uniform.key");
+      if (null != uniformKey) {
+        byte[] keyBytes = encryptionKeyMap.get(uniformKey);
+        if (null == keyBytes) throw new IOException("Uniform key not found: "+uniformKey);
+        EncryptionSetup eSetup  = new EncryptionSetup(cipher, keyBytes, uniformKey.getBytes(StandardCharsets.UTF_8));
+        fileEncryptor = ParquetEncryptionFactory.createFileEncryptor(eSetup);
+        extension = codec.getExtension() + ".parquet"+encryptedSuffix;
+      }
+      else {
+        EncryptionSetup eSetup = null;
+        String footerKey = conf.getTrimmed("encryption.footer.key");
+        if (null != footerKey) {
+          if (footerKey.equalsIgnoreCase("plaintext")) {
+            eSetup  = new EncryptionSetup(cipher, null, null);
+          }
+          else {
+            byte[] keyBytes = encryptionKeyMap.get(footerKey);
+            if (null == keyBytes) throw new IOException("Footer key not found: " + footerKey);
+            eSetup  = new EncryptionSetup(cipher, keyBytes, footerKey.getBytes(StandardCharsets.UTF_8));
+          }
+
+          String columnKeys[] = conf.getTrimmedStrings("encryption.column.keys");
+          if (null != columnKeys && columnKeys.length > 0) {
+            ArrayList<ColumnCryptodata> columns = new ArrayList<ColumnCryptodata>();
+            for (int i = 0; i < columnKeys.length; i++) {
+              String[] parts = columnKeys[i].split(":");
+              String columnKey = parts[1];
+              byte[] keyBytes = encryptionKeyMap.get(columnKey);
+              if (null == keyBytes) throw new IOException("Column key not found: " + columnKey);
+              ColumnCryptodata cmd = new ColumnCryptodata(true, parts[0]);
+              cmd.setEncryptionKey(keyBytes, columnKey.getBytes(StandardCharsets.UTF_8));
+              columns.add(cmd);
+            }
+            eSetup.setColumns(columns, false);
+            //TODO: parent is tmp (attempt)
+            //String AAD = file.getParent().getName()+"/"+file.getName();
+            //fileEncryptor.setAAD(AAD.getBytes("UTF-8"));
+
+            fileEncryptor = ParquetEncryptionFactory.createFileEncryptor(eSetup);
+
+            extension = codec.getExtension() + ".parquet"+encryptedSuffix;
+          }
+          else {
+            throw new IOException("Column keys not set");
+          }
+        }
+      }
     }
+
+    //System.out.println("ext: "+extension);
+    file = getDefaultWorkFile(taskAttemptContext, extension);
 
     return getRecordWriter(conf, file, codec, fileEncryptor);
   }
 
   public RecordWriter<Void, T> getRecordWriter(TaskAttemptContext taskAttemptContext, Path file)
       throws IOException, InterruptedException {
+    //TODO encr
     return getRecordWriter(getConfiguration(taskAttemptContext), file, getCodec(taskAttemptContext));
   }
-  
+
   public RecordWriter<Void, T> getRecordWriter(Configuration conf, Path file, CompressionCodecName codec)
       throws IOException, InterruptedException {
     return getRecordWriter(conf, file, codec, (ParquetFileEncryptor) null);
@@ -369,9 +410,9 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
 
   public RecordWriter<Void, T> getRecordWriter(Configuration conf, Path file, CompressionCodecName codec,
       ParquetFileEncryptor fileEncryptor)
-        throws IOException, InterruptedException {
+          throws IOException, InterruptedException {
     final WriteSupport<T> writeSupport = getWriteSupport(conf);
-    
+
     ParquetProperties props = ParquetProperties.builder()
         .withPageSize(getPageSize(conf))
         .withDictionaryPageSize(getDictionaryPageSize(conf))
@@ -468,4 +509,3 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
     return memoryManager;
   }
 }
-
