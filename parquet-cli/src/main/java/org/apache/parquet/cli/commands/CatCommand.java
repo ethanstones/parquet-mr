@@ -54,11 +54,11 @@ public class CatCommand extends BaseCommand {
       names = {"-c", "--column", "--columns"},
       description = "List of columns")
   List<String> columns;
-  
+
   @Parameter(names={"-e", "--encrypted-file"},
       description="Cat an encrypted Parquet file")
   boolean encrypt = false;
-  
+
   @Parameter(names={"--key"},
       description="Encryption key (base64 string)")
   String encodedKey;
@@ -77,7 +77,7 @@ public class CatCommand extends BaseCommand {
         "Only one file can be given");
 
     final String source = sourceFiles.get(0);
-    
+
     ParquetFileDecryptor fileDecryptor = null;
     if (encrypt) {
       byte[] keyBytes;
@@ -90,32 +90,38 @@ public class CatCommand extends BaseCommand {
       else {
         keyBytes = Base64.getDecoder().decode(encodedKey);
       }
-      
-      IntegerKeyIdRetriever kr = new IntegerKeyIdRetriever();
+
+      IntegerKeyIdRetriever kr = new IntegerKeyIdRetriever(){
+        @Override
+        public byte[] getKey(byte[] keyMetaData) {
+          byte[] key = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+          return key;
+        }
+      };
       kr.putKey(12, keyBytes);
-      
-      byte[] colKeyBytes = new byte[16]; 
+
+      byte[] colKeyBytes = new byte[16];
       for (byte i=0; i < 16; i++) {colKeyBytes[i] = (byte) (i%3);}
       String columnKey = Base64.getEncoder().encodeToString(colKeyBytes);
       console.info("Column key: " +columnKey);
-      
+
       // #1
       //kr.putKey(15, colKeyBytes);
-      
-      FileDecryptionProperties dSetup = new FileDecryptionProperties(kr);
-      
+
+      FileDecryptionProperties dSetup = new FileDecryptionProperties();
+      dSetup.setKeyRetriever(kr);
       byte[] aad = source.getBytes(StandardCharsets.UTF_8);
       console.info("AAD: "+source+". Len: "+aad.length);
-      
+
       // #2
-      dSetup.setAAD(aad); 
- 
- 
+      //dSetup.setAAD(aad);
+
+
       // #3
       //fileDecryptor = ParquetEncryptionFactory.createFileDecryptor(keyBytes);
       fileDecryptor = ParquetEncryptionFactory.createFileDecryptor(dSetup);
     }
-    
+
     Configuration conf = getConf();
 
     Schema schema = getAvroSchema(source, fileDecryptor);

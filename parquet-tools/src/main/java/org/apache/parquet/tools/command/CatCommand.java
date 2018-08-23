@@ -1,4 +1,4 @@
-/* 
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -6,9 +6,9 @@
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -34,6 +34,8 @@ import org.apache.parquet.tools.Main;
 import org.apache.parquet.tools.read.SimpleReadSupport;
 import org.apache.parquet.tools.read.SimpleRecord;
 import org.apache.parquet.tools.json.JsonRecordFormatter;
+import org.apache.parquet.crypto.FileDecryptionProperties;
+import org.apache.parquet.crypto.*;
 
 public class CatCommand extends ArgsOnlyCommand {
   public static final String[] USAGE = new String[] {
@@ -78,9 +80,27 @@ public class CatCommand extends ArgsOnlyCommand {
 
     ParquetReader<SimpleRecord> reader = null;
     try {
+      IntegerKeyIdRetriever kr = new IntegerKeyIdRetriever(){
+        @Override
+        public byte[] getKey(byte[] keyMetaData) {
+          byte[] key = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+          return key;
+        }
+      };
+      FileDecryptionProperties dSetup = new FileDecryptionProperties();
+      dSetup.setKeyRetriever(kr);
+
+      //byte[] aad = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+      //dSetup.setAAD(aad);
+
+      ParquetFileDecryptor fileDecryptor = ParquetEncryptionFactory.createFileDecryptor(dSetup);
+
+
       PrintWriter writer = new PrintWriter(Main.out, true);
-      reader = ParquetReader.builder(new SimpleReadSupport(), new Path(input)).build();
-      ParquetMetadata metadata = ParquetFileReader.readFooter(new Configuration(), new Path(input));
+      reader = ParquetReader.builder(new SimpleReadSupport(), new Path(input))
+        .withDecryptor(fileDecryptor)
+        .build();
+      ParquetMetadata metadata = ParquetFileReader.readFooter(new Configuration(), new Path(input), fileDecryptor);
       JsonRecordFormatter.JsonGroupFormatter formatter = JsonRecordFormatter.fromSchema(metadata.getFileMetaData().getSchema());
 
       for (SimpleRecord value = reader.read(); value != null; value = reader.read()) {

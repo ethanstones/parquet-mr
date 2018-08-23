@@ -68,11 +68,11 @@ public class ParquetMetadataCommand extends BaseCommand {
 
   @Parameter(description = "<parquet path>")
   List<String> targets;
-  
+
   @Parameter(names={"-e", "--encrypted-file"},
       description="Cat an encrypted Parquet file")
   boolean encrypt = false;
-  
+
   @Parameter(names={"--key"},
       description="Encryption key (base64 string)")
   String encodedKey;
@@ -87,7 +87,7 @@ public class ParquetMetadataCommand extends BaseCommand {
         "Cannot process multiple Parquet files.");
 
     String source = targets.get(0);
-    
+
     ParquetFileDecryptor fileDecryptor = null;
     if (encrypt) {
       byte[] keyBytes;
@@ -100,24 +100,25 @@ public class ParquetMetadataCommand extends BaseCommand {
       else {
         keyBytes = Base64.getDecoder().decode(encodedKey);
       }
-      
+
       IntegerKeyIdRetriever kr = new IntegerKeyIdRetriever();
       kr.putKey(12, keyBytes);
-      
-      byte[] colKeyBytes = new byte[16]; 
+
+      byte[] colKeyBytes = new byte[16];
       for (byte i=0; i < 16; i++) {colKeyBytes[i] = (byte) (i%3);}
       //kr.putKey(15, colKeyBytes);
-      
-      FileDecryptionProperties dSetup = new FileDecryptionProperties(kr);
-      
+
+      FileDecryptionProperties dSetup = new FileDecryptionProperties();
+      dSetup.setKeyRetriever(kr);
+
       byte[] aad = source.getBytes(StandardCharsets.UTF_8);
       console.info("AAD: "+source+". Len: "+aad.length);
-      dSetup.setAAD(aad); 
- 
+      dSetup.setAAD(aad);
+
       //fileDecryptor = ParquetEncryptionFactory.createFileDecryptor(keyBytes);
       fileDecryptor = ParquetEncryptionFactory.createFileDecryptor(dSetup);
     }
-    
+
     ParquetMetadata footer = ParquetFileReader.readFooter(
         getConf(), qualifiedPath(source), ParquetMetadataConverter.NO_FILTER, fileDecryptor);
 
@@ -163,9 +164,9 @@ public class ParquetMetadataCommand extends BaseCommand {
   }
 
   private void printRowGroup(Logger console, int index, BlockMetaData rowGroup, MessageType schema) {
-    
+
     console.info("");
-      
+
     long start = -1;
     try {
       start = rowGroup.getStartingPos();
@@ -192,7 +193,7 @@ public class ParquetMetadataCommand extends BaseCommand {
         humanReadable(uncompressedSize),
         filePath != null ? " path: " + filePath : "",
         StringUtils.leftPad("", 80, '-')));
-        
+
 
     int size = maxSize(Iterables.transform(rowGroup.getColumns(),
         new Function<ColumnChunkMetaData, String>() {
@@ -211,13 +212,13 @@ public class ParquetMetadataCommand extends BaseCommand {
 
   private void printColumnChunk(Logger console, int width, ColumnChunkMetaData column, MessageType schema) {
     String name = column.getPath().toDotString();
-    
+
     if (column.isHiddenColumn()) {
-      console.info(String.format("%-" + (width+1) + "s %-9s %s %-7s %-9s %-10s %-7s %s", 
+      console.info(String.format("%-" + (width+1) + "s %-9s %s %-7s %-9s %-10s %-7s %s",
           name, "HIDDEN", "-", "-", "-", "-", "-", "\"-\" / \"-\""));
       return;
     }
-    
+
     String[] path = column.getPath().toArray();
     PrimitiveType type = primitive(schema, path);
     Preconditions.checkNotNull(type);

@@ -1,4 +1,4 @@
-/* 
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -6,9 +6,9 @@
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -32,6 +32,7 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
+import org.apache.parquet.crypto.CryptoClassLoader;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.Preconditions;
 import org.apache.parquet.compression.CompressionCodecFactory;
@@ -45,6 +46,7 @@ import org.apache.parquet.HadoopReadOptions;
 import org.apache.parquet.hadoop.util.HiddenFileFilter;
 import org.apache.parquet.io.InputFile;
 
+
 /**
  * Read records from a Parquet file.
  * TODO: too many constructors (https://issues.apache.org/jira/browse/PARQUET-39)
@@ -54,7 +56,7 @@ public class ParquetReader<T> implements Closeable {
   private final ReadSupport<T> readSupport;
   private final Iterator<InputFile> filesIterator;
   private final ParquetReadOptions options;
-  
+
   private InternalParquetRecordReader<T> reader;
   private ParquetFileDecryptor fileDecryptor;
 
@@ -114,7 +116,7 @@ public class ParquetReader<T> implements Closeable {
         HadoopReadOptions.builder(conf)
             .withRecordFilter(checkNotNull(filter, "filter"))
             .build(),
-        readSupport, (ParquetFileDecryptor) null);
+        readSupport, CryptoClassLoader.getParquetFileDecryptorOrNull(conf));
   }
 
   private ParquetReader(List<InputFile> files,
@@ -155,7 +157,7 @@ public class ParquetReader<T> implements Closeable {
 
       ParquetFileReader fileReader = ParquetFileReader.open(file, options, fileDecryptor);
 
-      reader = new InternalParquetRecordReader<>(readSupport, options.getRecordFilter());
+      reader = new InternalParquetRecordReader<>(readSupport, options.getRecordFilter(), fileDecryptor);
 
       reader.initialize(fileReader, options);
     }
@@ -284,7 +286,7 @@ public class ParquetReader<T> implements Closeable {
       optionsBuilder.withCodecFactory(codecFactory);
       return this;
     }
-    
+
     public Builder<T> withDecryptor(ParquetFileDecryptor fileDecryptor) {
       this.fileDecryptor = fileDecryptor;
       return this;
@@ -304,6 +306,10 @@ public class ParquetReader<T> implements Closeable {
 
     public ParquetReader<T> build() throws IOException {
       ParquetReadOptions options = optionsBuilder.build();
+
+      if (fileDecryptor == null) {
+        fileDecryptor = CryptoClassLoader.getParquetFileDecryptorOrNull(conf);
+      }
 
       if (path != null) {
         FileSystem fs = path.getFileSystem(conf);

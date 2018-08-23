@@ -30,6 +30,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.HadoopReadOptions;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.datamask.DataMasker;
 import org.apache.parquet.filter.UnboundRecordFilter;
 import org.apache.parquet.filter2.compat.FilterCompat;
 import org.apache.parquet.filter2.compat.FilterCompat.Filter;
@@ -45,6 +46,7 @@ import org.apache.parquet.io.api.RecordMaterializer.RecordMaterializationExcepti
 import org.apache.parquet.schema.MessageType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.parquet.crypto.ParquetFileDecryptor;
 
 import static java.lang.String.format;
 import static org.apache.parquet.Preconditions.checkNotNull;
@@ -61,7 +63,8 @@ class InternalParquetRecordReader<T> {
   private MessageType requestedSchema;
   private MessageType fileSchema;
   private int columnCount;
-  private final ReadSupport<T> readSupport;
+  private ReadSupport<T> readSupport;
+  private DataMasker dataMasker;
 
   private RecordMaterializer<T> recordConverter;
 
@@ -81,13 +84,26 @@ class InternalParquetRecordReader<T> {
 
   private UnmaterializableRecordCounter unmaterializableRecordCounter;
 
+  private ParquetFileDecryptor fileDecryptor;
+
   /**
    * @param readSupport Object which helps reads files of the given type, e.g. Thrift, Avro.
    * @param filter for filtering individual records
    */
   public InternalParquetRecordReader(ReadSupport<T> readSupport, Filter filter) {
+    this(readSupport, filter, null);
+  }
+
+  /**
+   * @param readSupport Object which helps reads files of the given type, e.g. Thrift, Avro.
+   * @param filter for filtering individual records
+   * @param fileDecryptor for filtering decrypting records
+   */
+  public InternalParquetRecordReader(ReadSupport<T> readSupport, Filter filter, ParquetFileDecryptor fileDecryptor) {
     this.readSupport = readSupport;
     this.filter = checkNotNull(filter, "filter");
+    this.fileDecryptor = fileDecryptor;
+    this.dataMasker = DataMasker.Builder.build();
   }
 
   /**
@@ -171,10 +187,18 @@ class InternalParquetRecordReader<T> {
       conf.set(property, options.getProperty(property));
     }
 
+    if (this.readSupport == null) {
+      this.readSupport = ParquetInputFormat.getReadSupportInstance(conf);
+    }
+
     // initialize a ReadContext for this file
     this.reader = reader;
     FileMetaData parquetFileMetadata = reader.getFooter().getFileMetaData();
-    this.fileSchema = parquetFileMetadata.getSchema();
+    try {
+      this.fileSchema = dataMasker.removeMaskedColumns(fileDecryptor, parquetFileMetadata.getSchema());
+    } catch (Exception e) {
+      System.out.println(e);
+    }
     Map<String, String> fileMetadata = parquetFileMetadata.getKeyValueMetaData();
     ReadSupport.ReadContext readContext = readSupport.init(new InitContext(conf, toSetMultiMap(fileMetadata), fileSchema));
     this.columnIOFactory = new ColumnIOFactory(parquetFileMetadata.getCreatedBy());
@@ -191,10 +215,11 @@ class InternalParquetRecordReader<T> {
 
   public void initialize(ParquetFileReader reader, Configuration configuration)
       throws IOException {
+    this.readSupport = ParquetInputFormat.getReadSupportInstance(configuration);
     // initialize a ReadContext for this file
     this.reader = reader;
     FileMetaData parquetFileMetadata = reader.getFooter().getFileMetaData();
-    this.fileSchema = parquetFileMetadata.getSchema();
+    this.fileSchema = dataMasker.removeMaskedColumns(fileDecryptor, parquetFileMetadata.getSchema());
     Map<String, String> fileMetadata = parquetFileMetadata.getKeyValueMetaData();
     ReadSupport.ReadContext readContext = readSupport.init(new InitContext(
         configuration, toSetMultiMap(fileMetadata), fileSchema));
@@ -263,5 +288,4 @@ class InternalParquetRecordReader<T> {
     }
     return Collections.unmodifiableMap(setMultiMap);
   }
-
 }
