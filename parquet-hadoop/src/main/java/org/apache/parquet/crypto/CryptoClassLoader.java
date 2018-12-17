@@ -43,11 +43,8 @@ public class CryptoClassLoader {
    * @throws IOException
    */
   public static ParquetFileEncryptor getParquetFileEncryptorOrNull(Configuration conf, WriteContext writeContext) throws IOException {
-    if (!metadataRetrieverExists(conf)) {
-      return null;
-    }
-
-    FileEncDecryptorRetriever fileEncDecryptorRetriever = getFileEncDecryptorRetriever(conf);
+    // TODO: refactor to load FileEncDecryptorRetriever based on configuration file
+    FileEncDecryptorRetriever fileEncDecryptorRetriever = new SampleFileEncDecryptorRetriever();
     return fileEncDecryptorRetriever.getFileEncryptor(conf, writeContext);
   }
 
@@ -58,11 +55,8 @@ public class CryptoClassLoader {
    * @throws IOException
    */
   public static ParquetFileDecryptor getParquetFileDecryptorOrNull(Configuration conf) throws IOException {
-    if (!metadataRetrieverExists(conf)) {
-      return null;
-    }
-
-    FileEncDecryptorRetriever fileEncDecryptorRetriever = getFileEncDecryptorRetriever(conf);
+    // TODO: refactor to load FileEncDecryptorRetriever based on configuration file
+    FileEncDecryptorRetriever fileEncDecryptorRetriever = new SampleFileEncDecryptorRetriever();
     return fileEncDecryptorRetriever.getFileDecryptor(conf);
   }
 

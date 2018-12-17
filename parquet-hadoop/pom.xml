@@ -110,6 +110,11 @@
       <version>${slf4j.version}</version>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>com.uber.cryptometadataretriever</groupId>
+      <artifactId>cryptometadataretriever</artifactId>
+      <version>1.0</version>
+    </dependency>
   </dependencies>
 
   <build>
